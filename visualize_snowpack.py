@@ -6,116 +6,228 @@ Creates an interactive map showing HUC-12 watersheds with SNOTEL station
 locations colored by their Basin Index (% of median snowpack).
 
 Usage:
+    # Use latest data from database
     python visualize_snowpack.py --state OR
-    python visualize_snowpack.py --state CA --output ca_snowpack.html
+    
+    # Specify a date
+    python visualize_snowpack.py --state OR --date 2025-01-15
+    
+    # All states
+    python visualize_snowpack.py --all-states --date 2025-12-01
+    
+    # List available dates
+    python visualize_snowpack.py --list-dates
+    
+    # Use API instead of database (for dates not in DB)
+    python visualize_snowpack.py --state OR --use-api
 """
 
 import argparse
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import folium
 import geopandas as gpd
-import numpy as np
+import pandas as pd
 from branca.colormap import LinearColormap
-from folium.plugins import MarkerCluster
+from shapely.geometry import Point
+from sqlalchemy import text
 
-from config import RAW_DATA_DIR, PROCESSED_DATA_DIR, STATES_OF_INTEREST
-from nwcc_api import NWCCClient
+from config import RAW_DATA_DIR, PROCESSED_DATA_DIR, STATES_OF_INTEREST, DATABASE_URL
 
 
-def get_snotel_data(state: str, date: str = None) -> gpd.GeoDataFrame:
+def get_available_dates():
+    """Get list of available dates in the database."""
+    from models import get_session
+    session = get_session()
+    
+    result = session.execute(text("""
+        SELECT 
+            MIN(observation_date) as earliest,
+            MAX(observation_date) as latest,
+            COUNT(DISTINCT observation_date) as total_dates
+        FROM daily_observations
+    """)).fetchone()
+    
+    session.close()
+    return {
+        "earliest": result[0],
+        "latest": result[1],
+        "total_dates": result[2],
+    }
+
+
+def get_snotel_data_from_db(
+    target_date: date,
+    states: list[str] = None,
+) -> gpd.GeoDataFrame:
     """
-    Fetch SNOTEL station data and return as GeoDataFrame.
+    Fetch SNOTEL data from the PostgreSQL database.
     
     Args:
-        state: Two-letter state code
-        date: Date string (YYYY-MM-DD), defaults to yesterday
+        target_date: Date to fetch data for
+        states: List of state codes (default: all)
         
     Returns:
         GeoDataFrame with station locations and snowpack data
     """
-    if date is None:
-        date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    from models import get_session
+    
+    if states is None:
+        states = list(STATES_OF_INTEREST.keys())
+    
+    session = get_session()
+    
+    # Query the database
+    query = text("""
+        SELECT 
+            s.triplet,
+            s.name,
+            s.state_code,
+            s.county_name,
+            s.huc,
+            s.elevation,
+            s.latitude,
+            s.longitude,
+            d.observation_date,
+            d.wteq_value,
+            d.wteq_median,
+            d.wteq_pct_median as basin_index,
+            d.snwd_value as snow_depth,
+            d.prec_value as precip,
+            d.tmax_value as temp_max,
+            d.tmin_value as temp_min
+        FROM stations s
+        JOIN daily_observations d ON s.id = d.station_id
+        WHERE d.observation_date = :target_date
+          AND s.state_code = ANY(:states)
+          AND s.latitude IS NOT NULL
+          AND s.longitude IS NOT NULL
+    """)
+    
+    result = session.execute(query, {
+        "target_date": target_date,
+        "states": states,
+    }).fetchall()
+    
+    session.close()
+    
+    if not result:
+        print(f"No data found for {target_date}")
+        return gpd.GeoDataFrame()
+    
+    # Convert to DataFrame
+    columns = [
+        "triplet", "name", "state_code", "county_name", "huc", "elevation",
+        "latitude", "longitude", "observation_date", "wteq_value", "wteq_median",
+        "basin_index", "snow_depth", "precip", "temp_max", "temp_min"
+    ]
+    df = pd.DataFrame(result, columns=columns)
+    
+    # Create geometry
+    geometry = [Point(row.longitude, row.latitude) for row in df.itertuples()]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+    
+    print(f"Retrieved {len(gdf)} stations for {target_date}")
+    return gdf
+
+
+def get_snotel_data_from_api(
+    target_date: date,
+    states: list[str] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Fetch SNOTEL data from the NWCC API.
+    
+    Args:
+        target_date: Date to fetch data for
+        states: List of state codes (default: all)
+        
+    Returns:
+        GeoDataFrame with station locations and snowpack data
+    """
+    from nwcc_api import NWCCClient
+    
+    if states is None:
+        states = list(STATES_OF_INTEREST.keys())
     
     client = NWCCClient()
+    date_str = target_date.strftime("%Y-%m-%d")
     
-    # Get stations
-    print(f"Fetching {state} SNOTEL stations...")
-    stations = client.get_stations(state=state, network="SNTL")
-    stations_dict = {s["stationTriplet"]: s for s in stations}
-    triplets = list(stations_dict.keys())
+    all_results = []
     
-    print(f"Found {len(triplets)} active stations")
-    
-    # Get data
-    print("Fetching snow data...")
-    data = client.get_data(
-        station_triplets=triplets,
-        elements=["WTEQ", "SNWD"],
-        begin_date=date,
-        end_date=date,
-        include_median=True,
-        batch_size=10,
-    )
-    
-    # Process results
-    results = []
-    for station_data in data:
-        triplet = station_data.get("stationTriplet", "")
-        station_info = stations_dict.get(triplet, {})
+    for state in states:
+        print(f"Fetching {state} SNOTEL stations...")
+        stations = client.get_stations(state=state, network="SNTL")
+        stations_dict = {s["stationTriplet"]: s for s in stations}
+        triplets = list(stations_dict.keys())
         
-        lat = station_info.get("latitude")
-        lon = station_info.get("longitude")
+        print(f"  Found {len(triplets)} stations, fetching data...")
+        data = client.get_data(
+            station_triplets=triplets,
+            elements=["WTEQ", "SNWD"],
+            begin_date=date_str,
+            end_date=date_str,
+            include_median=True,
+            batch_size=15,
+        )
         
-        if lat is None or lon is None:
-            continue
-        
-        wteq = wteq_med = snwd = None
-        
-        for elem_data in station_data.get("data", []):
-            elem = elem_data.get("stationElement", {}).get("elementCode", "")
-            values = elem_data.get("values", [])
+        for station_data in data:
+            triplet = station_data.get("stationTriplet", "")
+            station_info = stations_dict.get(triplet, {})
             
-            if values:
-                latest = values[-1]
-                val = latest.get("value")
+            lat = station_info.get("latitude")
+            lon = station_info.get("longitude")
+            
+            if lat is None or lon is None:
+                continue
+            
+            wteq = wteq_med = snwd = None
+            
+            for elem_data in station_data.get("data", []):
+                elem = elem_data.get("stationElement", {}).get("elementCode", "")
+                values = elem_data.get("values", [])
                 
-                if val is not None and val != -9999.9:
-                    if elem == "WTEQ":
-                        wteq = val
-                        wteq_med = latest.get("median")
-                    elif elem == "SNWD":
-                        snwd = val
-        
-        # Calculate basin index (% of median)
-        basin_index = None
-        if wteq is not None and wteq_med is not None and wteq_med > 0:
-            basin_index = (wteq / wteq_med) * 100
-        elif wteq == 0:
-            basin_index = 0
+                if values:
+                    latest = values[-1]
+                    val = latest.get("value")
+                    
+                    if val is not None and val != -9999.9:
+                        if elem == "WTEQ":
+                            wteq = val
+                            wteq_med = latest.get("median")
+                        elif elem == "SNWD":
+                            snwd = val
             
-        results.append({
-            "triplet": triplet,
-            "name": station_info.get("name", triplet),
-            "latitude": lat,
-            "longitude": lon,
-            "elevation": station_info.get("elevation", 0),
-            "huc": station_info.get("huc", ""),
-            "wteq": wteq,
-            "median": wteq_med,
-            "basin_index": basin_index,
-            "snow_depth": snwd,
-        })
+            basin_index = None
+            if wteq is not None and wteq_med is not None and wteq_med > 0:
+                basin_index = (wteq / wteq_med) * 100
+            elif wteq == 0:
+                basin_index = 0
+            
+            all_results.append({
+                "triplet": triplet,
+                "name": station_info.get("name", triplet),
+                "state_code": state,
+                "latitude": lat,
+                "longitude": lon,
+                "elevation": station_info.get("elevation", 0),
+                "huc": station_info.get("huc", ""),
+                "wteq_value": wteq,
+                "wteq_median": wteq_med,
+                "basin_index": basin_index,
+                "snow_depth": snwd,
+            })
     
-    # Create GeoDataFrame
-    from shapely.geometry import Point
+    if not all_results:
+        return gpd.GeoDataFrame()
     
-    geometry = [Point(r["longitude"], r["latitude"]) for r in results]
-    gdf = gpd.GeoDataFrame(results, geometry=geometry, crs="EPSG:4326")
+    df = pd.DataFrame(all_results)
+    geometry = [Point(row.longitude, row.latitude) for row in df.itertuples()]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
     
-    print(f"Retrieved data for {len(gdf)} stations")
+    print(f"Retrieved {len(gdf)} stations total")
     return gdf
 
 
@@ -124,40 +236,27 @@ def load_huc12_watersheds(
     bbox: tuple = None,
     max_watersheds: int = 2000,
 ) -> gpd.GeoDataFrame:
-    """
-    Load HUC-12 watersheds, optionally filtered to specific states or bounding box.
-    
-    Args:
-        states: List of state codes to filter to (e.g., ['OR', 'CA'])
-        bbox: Optional (minx, miny, maxx, maxy) to spatially filter
-        max_watersheds: Maximum number of watersheds to return
-        
-    Returns:
-        GeoDataFrame of HUC-12 watersheds
-    """
+    """Load HUC-12 watersheds, optionally filtered."""
     wbd_path = RAW_DATA_DIR / "watershed/national/WBD_National_GDB/WBD_National_GDB.gdb"
     
     if not wbd_path.exists():
         raise FileNotFoundError(f"WBD geodatabase not found at {wbd_path}")
     
-    print("Loading HUC-12 watersheds (this may take a moment)...")
+    print("Loading HUC-12 watersheds...")
     
-    # Use bbox to limit initial load if provided
     if bbox:
         watersheds = gpd.read_file(wbd_path, layer="WBDHU12", bbox=bbox)
-        print(f"Loaded {len(watersheds)} watersheds in bounding box")
+        print(f"  Loaded {len(watersheds)} watersheds in bounding box")
     else:
         watersheds = gpd.read_file(wbd_path, layer="WBDHU12")
     
     if states:
-        # Filter by state codes in HUC
-        # HUC-12 codes starting with specific 2-digit regions for western states
-        # This is approximate - HUCs don't align perfectly with state boundaries
         state_huc_prefixes = {
-            "CA": ["18"],  # California region
-            "NV": ["16"],  # Great Basin 
-            "OR": ["17"],  # Pacific Northwest
-            "WA": ["17"],  # Pacific Northwest
+            "CA": ["18"],
+            "ID": ["17"],
+            "NV": ["16"],
+            "OR": ["17"],
+            "WA": ["17"],
         }
         
         prefixes = []
@@ -165,21 +264,20 @@ def load_huc12_watersheds(
             prefixes.extend(state_huc_prefixes.get(state.upper(), []))
         
         if prefixes:
-            prefixes = list(set(prefixes))  # Remove duplicates
+            prefixes = list(set(prefixes))
             mask = watersheds["huc12"].str[:2].isin(prefixes)
             watersheds = watersheds[mask]
-            print(f"Filtered to {len(watersheds)} watersheds in regions: {prefixes}")
+            print(f"  Filtered to {len(watersheds)} watersheds")
     
-    # Limit the number of watersheds if too many
     if len(watersheds) > max_watersheds:
-        print(f"Limiting to {max_watersheds} watersheds for performance")
+        print(f"  Limiting to {max_watersheds} watersheds for performance")
         watersheds = watersheds.head(max_watersheds)
     
     return watersheds
 
 
 def load_state_boundaries(states: list[str]) -> gpd.GeoDataFrame:
-    """Load state boundaries for the specified states."""
+    """Load state boundaries."""
     states_path = RAW_DATA_DIR / "political/national/tl_2023_us_state"
     shp_file = list(states_path.glob("*.shp"))[0]
     
@@ -194,21 +292,16 @@ def create_snowpack_map(
     watersheds_gdf: gpd.GeoDataFrame = None,
     state_boundaries: gpd.GeoDataFrame = None,
     title: str = "SNOTEL Basin Index Map",
+    target_date: date = None,
     output_path: str = None,
 ) -> folium.Map:
     """
     Create an interactive map showing snowpack conditions.
-    
-    Args:
-        snotel_gdf: GeoDataFrame with SNOTEL station data
-        watersheds_gdf: Optional GeoDataFrame with HUC-12 boundaries
-        state_boundaries: Optional GeoDataFrame with state boundaries
-        title: Map title
-        output_path: Path to save HTML file
-        
-    Returns:
-        folium.Map object
     """
+    if snotel_gdf.empty:
+        print("No data to map!")
+        return None
+    
     # Calculate map center
     center_lat = snotel_gdf.geometry.y.mean()
     center_lon = snotel_gdf.geometry.x.mean()
@@ -216,7 +309,7 @@ def create_snowpack_map(
     # Create base map
     m = folium.Map(
         location=[center_lat, center_lon],
-        zoom_start=7,
+        zoom_start=6,
         tiles="CartoDB positron",
     )
     
@@ -234,8 +327,7 @@ def create_snowpack_map(
         ).add_to(m)
     
     # Add HUC-12 watersheds
-    if watersheds_gdf is not None:
-        # Simplify for performance and select only needed columns
+    if watersheds_gdf is not None and not watersheds_gdf.empty:
         watersheds_simple = watersheds_gdf[["name", "huc12", "geometry"]].copy()
         watersheds_simple["geometry"] = watersheds_simple.geometry.simplify(0.01)
         watersheds_simple = watersheds_simple.to_crs("EPSG:4326")
@@ -255,7 +347,7 @@ def create_snowpack_map(
             ),
         ).add_to(m)
     
-    # Create color map (red to yellow to green, 0-100 scale)
+    # Create color map (red to green, 0-100 scale)
     colormap = LinearColormap(
         colors=["#d73027", "#fc8d59", "#fee08b", "#d9ef8b", "#91cf60", "#1a9850"],
         vmin=0,
@@ -266,42 +358,41 @@ def create_snowpack_map(
     
     # Add SNOTEL stations as colored markers
     for idx, row in snotel_gdf.iterrows():
-        basin_index = row["basin_index"]
+        basin_index = row.get("basin_index")
         
-        # Determine color
-        if basin_index is None:
-            color = "#808080"  # Gray for no data
+        if basin_index is None or pd.isna(basin_index):
+            color = "#808080"
             basin_str = "N/A"
         else:
-            # Clamp to 0-150 for color mapping (allow >100%)
             clamped = max(0, min(150, basin_index))
             color = colormap(min(clamped, 100))
             basin_str = f"{basin_index:.0f}%"
         
-        # Create popup content
-        wteq_str = f"{row['wteq']:.1f}\"" if row['wteq'] is not None else "N/A"
-        median_str = f"{row['median']:.1f}\"" if row['median'] is not None else "N/A"
-        snwd_str = f"{row['snow_depth']:.0f}\"" if row['snow_depth'] is not None else "N/A"
+        # Format values for popup
+        wteq_str = f"{row.get('wteq_value', 0):.1f}\"" if row.get('wteq_value') is not None else "N/A"
+        median_str = f"{row.get('wteq_median', 0):.1f}\"" if row.get('wteq_median') is not None else "N/A"
+        snwd_str = f"{row.get('snow_depth', 0):.0f}\"" if row.get('snow_depth') is not None else "N/A"
+        elev = row.get('elevation', 0) or 0
         
         popup_html = f"""
         <div style="font-family: Arial, sans-serif; width: 200px;">
-            <h4 style="margin: 0 0 8px 0; color: #333;">{row['name']}</h4>
+            <h4 style="margin: 0 0 8px 0; color: #333;">{row.get('name', 'Unknown')}</h4>
             <table style="width: 100%; font-size: 12px;">
                 <tr><td><b>Basin Index:</b></td><td style="color: {color}; font-weight: bold;">{basin_str}</td></tr>
                 <tr><td><b>WTEQ:</b></td><td>{wteq_str}</td></tr>
                 <tr><td><b>Median:</b></td><td>{median_str}</td></tr>
                 <tr><td><b>Snow Depth:</b></td><td>{snwd_str}</td></tr>
-                <tr><td><b>Elevation:</b></td><td>{row['elevation']:.0f} ft</td></tr>
-                <tr><td><b>HUC:</b></td><td>{row['huc']}</td></tr>
+                <tr><td><b>Elevation:</b></td><td>{elev:.0f} ft</td></tr>
+                <tr><td><b>HUC:</b></td><td>{row.get('huc', 'N/A')}</td></tr>
             </table>
         </div>
         """
         
         folium.CircleMarker(
-            location=[row["latitude"], row["longitude"]],
+            location=[row.geometry.y, row.geometry.x],
             radius=10,
             popup=folium.Popup(popup_html, max_width=250),
-            tooltip=f"{row['name']}: {basin_str}",
+            tooltip=f"{row.get('name', 'Unknown')}: {basin_str}",
             color="#333333",
             weight=1,
             fill=True,
@@ -310,14 +401,14 @@ def create_snowpack_map(
         ).add_to(m)
     
     # Add title
+    date_str = target_date.strftime('%Y-%m-%d') if target_date else "Latest"
     title_html = f"""
     <div style="position: fixed; top: 10px; left: 50px; z-index: 1000;
                 background-color: white; padding: 10px 20px; border-radius: 5px;
                 box-shadow: 0 2px 6px rgba(0,0,0,0.3); font-family: Arial, sans-serif;">
         <h3 style="margin: 0; color: #333;">{title}</h3>
         <p style="margin: 5px 0 0 0; font-size: 12px; color: #666;">
-            Data Date: {(datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')}
-            | Stations: {len(snotel_gdf)}
+            Date: {date_str} | Stations: {len(snotel_gdf)}
         </p>
     </div>
     """
@@ -326,7 +417,6 @@ def create_snowpack_map(
     # Add layer control
     folium.LayerControl().add_to(m)
     
-    # Save if output path provided
     if output_path:
         m.save(output_path)
         print(f"Map saved to: {output_path}")
@@ -335,21 +425,38 @@ def create_snowpack_map(
 
 
 def main():
-    """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Create snowpack visualization map"
     )
     parser.add_argument(
         "--state",
         type=str,
-        default="OR",
-        help="State code (default: OR)"
+        help="State code (e.g., OR, CA, WA)"
+    )
+    parser.add_argument(
+        "--all-states",
+        action="store_true",
+        help="Include all states of interest"
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="Date to visualize (YYYY-MM-DD, default: latest in DB)"
     )
     parser.add_argument(
         "--no-watersheds",
         action="store_true",
-        default=False,
-        help="Skip loading HUC-12 watershed boundaries (faster)"
+        help="Skip loading HUC-12 watershed boundaries"
+    )
+    parser.add_argument(
+        "--use-api",
+        action="store_true",
+        help="Fetch data from API instead of database"
+    )
+    parser.add_argument(
+        "--list-dates",
+        action="store_true",
+        help="List available dates in the database"
     )
     parser.add_argument(
         "--output",
@@ -359,52 +466,85 @@ def main():
     
     args = parser.parse_args()
     
-    # Set default output path
-    if args.output is None:
-        PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        args.output = str(PROCESSED_DATA_DIR / f"snowpack_map_{args.state.lower()}.html")
+    # List dates mode
+    if args.list_dates:
+        dates = get_available_dates()
+        print(f"Available dates in database:")
+        print(f"  Earliest: {dates['earliest']}")
+        print(f"  Latest:   {dates['latest']}")
+        print(f"  Total:    {dates['total_dates']} dates")
+        return 0
     
-    # Get SNOTEL data
-    snotel_gdf = get_snotel_data(args.state)
+    # Determine states
+    if args.all_states:
+        states = list(STATES_OF_INTEREST.keys())
+    elif args.state:
+        states = [args.state.upper()]
+    else:
+        print("Error: Specify --state or --all-states")
+        parser.print_help()
+        return 1
     
-    # Load watersheds (unless --no-watersheds is specified)
+    # Determine date
+    if args.date:
+        target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        dates = get_available_dates()
+        target_date = dates['latest']
+        print(f"Using latest date in database: {target_date}")
+    
+    # Fetch data
+    if args.use_api:
+        snotel_gdf = get_snotel_data_from_api(target_date, states)
+    else:
+        snotel_gdf = get_snotel_data_from_db(target_date, states)
+    
+    if snotel_gdf.empty:
+        print("No data found!")
+        return 1
+    
+    # Load watersheds
     watersheds_gdf = None
     if not args.no_watersheds:
         try:
-            # Calculate bounding box from SNOTEL stations with buffer
-            bounds = snotel_gdf.total_bounds  # minx, miny, maxx, maxy
-            buffer = 0.5  # degrees
-            bbox = (
-                bounds[0] - buffer,
-                bounds[1] - buffer,
-                bounds[2] + buffer,
-                bounds[3] + buffer,
-            )
-            watersheds_gdf = load_huc12_watersheds(states=[args.state], bbox=bbox)
+            bounds = snotel_gdf.total_bounds
+            buffer = 0.5
+            bbox = (bounds[0] - buffer, bounds[1] - buffer, bounds[2] + buffer, bounds[3] + buffer)
+            watersheds_gdf = load_huc12_watersheds(states=states, bbox=bbox)
         except FileNotFoundError as e:
             print(f"Warning: Could not load watersheds: {e}")
     
     # Load state boundaries
     try:
-        state_boundaries = load_state_boundaries([args.state])
+        state_boundaries = load_state_boundaries(states)
     except Exception as e:
         print(f"Warning: Could not load state boundaries: {e}")
         state_boundaries = None
     
+    # Set output path
+    if args.output:
+        output_path = args.output
+    else:
+        PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        state_str = "_".join(s.lower() for s in sorted(states))
+        date_str = target_date.strftime("%Y%m%d")
+        output_path = str(PROCESSED_DATA_DIR / f"snowpack_{state_str}_{date_str}.html")
+    
     # Create map
-    title = f"{args.state} SNOTEL Basin Index"
+    title = f"SNOTEL Basin Index - {', '.join(states)}"
     create_snowpack_map(
         snotel_gdf=snotel_gdf,
         watersheds_gdf=watersheds_gdf,
         state_boundaries=state_boundaries,
         title=title,
-        output_path=args.output,
+        target_date=target_date,
+        output_path=output_path,
     )
     
     # Print summary
     valid_indices = snotel_gdf["basin_index"].dropna()
     if len(valid_indices) > 0:
-        print(f"\nBasin Index Summary:")
+        print(f"\nBasin Index Summary ({target_date}):")
         print(f"  Stations with data: {len(valid_indices)}")
         print(f"  Average: {valid_indices.mean():.0f}%")
         print(f"  Min: {valid_indices.min():.0f}%")
@@ -415,4 +555,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

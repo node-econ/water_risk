@@ -59,9 +59,9 @@ data/processed/*.html
 logs/*.log
 *.log
 
-# Database dumps
-*.sql
+# Database dumps (but allow setup scripts)
 *.dump
+!setup_*.sql
 
 # QGIS project files (optional - uncomment if you want to track)
 # *.qgz
