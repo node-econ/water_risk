@@ -34,3 +34,6 @@ psycopg2-binary>=2.9.0
 # Jupyter support (optional, for exploration)
 jupyterlab>=4.0.0
 ipywidgets>=8.0.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart>=0.0.6
