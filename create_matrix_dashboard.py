@@ -91,11 +91,13 @@ def compute_pairwise_matrix(
                     else:
                         val = compute_fft_similarity(s1, s2)
                 elif method == "edm":
+                    # Use optimize_params=False for speed in pairwise matrix
+                    # Default E=3, tau=7 provides good results without pyEDM overhead
                     if use_delta:
                         d1, d2 = compute_delta(s1), compute_delta(s2)
-                        val = edm_simplex_similarity(d1, d2)
+                        val = edm_simplex_similarity(d1, d2, optimize_params=False)
                     else:
-                        val = edm_simplex_similarity(s1, s2)
+                        val = edm_simplex_similarity(s1, s2, optimize_params=False)
                 else:
                     val = np.nan
                 
@@ -330,7 +332,7 @@ def generate_dashboard(output_path: str):
             correlation: 'Pearson correlation: 1.0 = identical, 0 = no relationship, -1 = inverse',
             dtw: 'Dynamic Time Warping distance: 0 = identical, higher = more different',
             fft: 'FFT spectral similarity: 1.0 = identical frequency content, 0 = different',
-            edm: 'Empirical Dynamic Modeling: 1.0 = identical dynamics, 0 = different'
+            edm: 'Empirical Dynamic Modeling (Sugihara et al.): State-space trajectory comparison using time-delay embedding. 1.0 = identical dynamics.'
         }};
         
         // Initialize station dropdown
