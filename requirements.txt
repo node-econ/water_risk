@@ -1,3 +1,6 @@
+# Configuration
+python-dotenv>=1.0.0
+
 # Data acquisition
 requests>=2.31.0
 tqdm>=4.66.0
@@ -30,6 +33,11 @@ contextily>=1.4.0
 sqlalchemy>=2.0.0
 geoalchemy2>=0.14.0
 psycopg2-binary>=2.9.0
+
+# Time series analysis
+tslearn>=0.6.0
+dtaidistance>=2.3.0
+pyEDM>=2.3.0
 
 # Jupyter support (optional, for exploration)
 jupyterlab>=4.0.0

@@ -1,9 +1,23 @@
 """
 Configuration for the Water Risk data acquisition system.
 Defines data sources, URLs, and preferences for spatial data downloads.
+
+Environment variables (set in .env file):
+    DATABASE_HOST - Database hostname (default: localhost)
+    DATABASE_PORT - Database port (default: 5432)
+    DATABASE_NAME - Database name (default: water_risk)
+    DATABASE_USER - Database user (default: postgres)
+    DATABASE_PASSWORD - Database password (default: empty)
+    DATABASE_SSLMODE - SSL mode for connection (default: prefer)
 """
 
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Project directories
 PROJECT_ROOT = Path(__file__).parent
@@ -378,14 +392,23 @@ DOWNLOAD_SETTINGS = {
     "verify_ssl": True,
 }
 
-# Database configuration
+# Database configuration (loads from environment variables)
 DATABASE_CONFIG = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "water_risk",
-    "user": "postgres",
-    "password": "",  # Empty password for local development
+    "host": os.getenv("DATABASE_HOST", "localhost"),
+    "port": int(os.getenv("DATABASE_PORT", "5432")),
+    "database": os.getenv("DATABASE_NAME", "water_risk"),
+    "user": os.getenv("DATABASE_USER", "postgres"),
+    "password": os.getenv("DATABASE_PASSWORD", ""),
+    "sslmode": os.getenv("DATABASE_SSLMODE", "prefer"),
 }
 
-DATABASE_URL = f"postgresql://{DATABASE_CONFIG['user']}@{DATABASE_CONFIG['host']}:{DATABASE_CONFIG['port']}/{DATABASE_CONFIG['database']}"
+# Build connection URL
+_password_part = f":{DATABASE_CONFIG['password']}" if DATABASE_CONFIG['password'] else ""
+_ssl_part = f"?sslmode={DATABASE_CONFIG['sslmode']}" if DATABASE_CONFIG['sslmode'] != "prefer" else ""
+
+DATABASE_URL = (
+    f"postgresql://{DATABASE_CONFIG['user']}{_password_part}"
+    f"@{DATABASE_CONFIG['host']}:{DATABASE_CONFIG['port']}"
+    f"/{DATABASE_CONFIG['database']}{_ssl_part}"
+)
 

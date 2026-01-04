@@ -6,8 +6,9 @@ Environmental data acquisition and analysis system for water risk assessment acr
 
 - **SNOTEL Data Collection**: Automated daily collection of snow water equivalent, snow depth, precipitation, and temperature data from 339 stations
 - **Historical Database**: 30 years of daily observations (1995-present) stored in PostgreSQL
+- **Water Year Similarity Analysis**: Compare water years using multiple similarity metrics (correlation, DTW, FFT, EDM)
 - **Geospatial Integration**: HUC-12 watersheds, political boundaries, protected areas
-- **Visualization**: Interactive maps with Basin Index color ramps
+- **Visualization**: Interactive maps, similarity matrices, and time series comparisons
 
 ## Quick Start
 
@@ -45,10 +46,14 @@ water_risk/
 ├── visualize_snowpack.py        # Interactive map generation
 ├── download_spatial_data.py     # Geospatial data downloads
 ├── process_spatial_data.py      # Geospatial processing utilities
+├── water_year_similarity.py     # Water year similarity analysis
+├── water_year_spectral.py       # Spectral similarity methods (FFT, wavelet)
+├── create_matrix_dashboard.py   # Interactive similarity matrix dashboard
 ├── requirements.txt             # Python dependencies
+├── .env.example                 # Environment variable template
 ├── data/
 │   ├── raw/                     # Downloaded geospatial datasets
-│   └── processed/               # Analysis-ready outputs
+│   └── processed/               # Analysis outputs and dashboards
 └── logs/                        # Daily update logs
 ```
 
@@ -142,6 +147,77 @@ Features:
 - Red-Yellow-Green color ramp (0-100% of median)
 - Interactive popups with station details
 
+## Water Year Similarity Analysis
+
+Compare the daily evolution of Snow Water Equivalent (SWE) across water years to find historically similar patterns.
+
+### Similarity Methods
+
+| Method | Description | Best For |
+|--------|-------------|----------|
+| **Correlation** | Pearson correlation of SWE patterns | Shape similarity |
+| **DTW** | Dynamic Time Warping distance | Timing-shifted patterns |
+| **FFT** | Fourier transform spectral similarity | Frequency content |
+| **EDM** | Empirical Dynamic Modeling | State-space dynamics |
+
+### Data Transformations
+
+| Transform | Description |
+|-----------|-------------|
+| **Raw SWE** | Original snow water equivalent values |
+| **Δ SWE** | Daily change (first derivative) - captures accumulation/melt dynamics |
+
+### Usage
+
+```python
+from water_year_similarity import (
+    extract_station_water_years,
+    compute_all_similarities,
+    find_most_similar_years,
+)
+from sqlalchemy import create_engine
+from config import DATABASE_URL
+
+engine = create_engine(DATABASE_URL)
+
+# Extract water year data for a station
+wy_data = extract_station_water_years(engine, '473:CA:SNTL', 1996, 2025)
+
+# Find most similar years to WY 2020
+similar = find_most_similar_years(wy_data, target_wy=2020, n_similar=5, method='correlation')
+
+# Compare using all methods (including delta methods)
+all_methods = ['dtw', 'correlation', 'euclidean', 'edm', 
+               'delta_correlation', 'delta_dtw', 'delta_euclidean', 'delta_fft']
+results = compute_all_similarities(wy_data, target_wy=2020, methods=all_methods)
+```
+
+### Interactive Dashboard
+
+Generate an interactive N×N similarity matrix dashboard:
+
+```bash
+python create_matrix_dashboard.py
+# Output: data/processed/wy_matrix_dashboard.html
+```
+
+Features:
+- Station selector (10 SNOTEL stations)
+- Method selector (Correlation, DTW, FFT, EDM)
+- Raw SWE vs Δ SWE toggle
+- Interactive heatmap with hover values
+- Automatic identification of most/least similar year pairs
+
+### Key Scripts
+
+| Script | Description |
+|--------|-------------|
+| `water_year_similarity.py` | Core similarity functions and data extraction |
+| `water_year_spectral.py` | FFT, PAA, SAX, and wavelet methods |
+| `create_matrix_dashboard.py` | Generate interactive HTML dashboard |
+| `visualize_water_year_similarity.py` | Static matplotlib visualizations |
+| `visualize_wy_interactive.py` | Plotly interactive visualizations |
+
 ## Geospatial Data
 
 ### Automatically Downloaded
@@ -206,9 +282,28 @@ See `requirements.txt` for complete list.
 
 ## Configuration
 
+### Environment Variables
+
+Database credentials are loaded from a `.env` file:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit with your credentials
+DB_HOST="your-host.db.ondigitalocean.com"
+DB_PORT="25060"
+DB_NAME="water_risk"
+DB_USER="doadmin"
+DB_PASSWORD="your_password_here"
+DB_SSLMODE="require"
+```
+
+### config.py Settings
+
 Edit `config.py` to modify:
 - `STATES_OF_INTEREST`: States to include
-- `DATABASE_CONFIG`: PostgreSQL connection
+- `DATABASE_CONFIG`: PostgreSQL connection (uses env vars)
 - `DATA_SOURCES`: Geospatial dataset URLs
 
 ## License
