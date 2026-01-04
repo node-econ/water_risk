@@ -482,67 +482,129 @@ def euclidean_distance(series1: np.ndarray, series2: np.ndarray) -> float:
 def edm_simplex_similarity(
     series1: np.ndarray,
     series2: np.ndarray,
-    embedding_dim: int = 3,
+    embedding_dim: Optional[int] = None,
+    optimize_params: bool = True,
+    method: str = 'attractor',
 ) -> float:
     """Calculate similarity using Empirical Dynamic Modeling concepts.
     
-    Uses state-space reconstruction and nearest neighbor distances to
-    measure trajectory similarity. Based on Sugihara & May (1990).
+    Uses state-space reconstruction following Sugihara & May (1990) and
+    the pyEDM library when available.
     
-    The idea: If two years have similar dynamics, their trajectories
-    in reconstructed state space should be close to each other.
+    The method:
+    1. Auto-select optimal embedding dimension E using prediction skill
+    2. Auto-select optimal time delay tau using autocorrelation decay
+    3. Create time-delay embeddings (Takens' theorem)
+    4. Compare attractor trajectories or cross-prediction skill
     
     Args:
-        embedding_dim: Dimension for time-delay embedding (typically 2-5)
+        embedding_dim: Dimension for time-delay embedding (auto-optimized if None)
+        optimize_params: Whether to auto-optimize E and tau (default True)
+        method: 'attractor' (trajectory comparison) or 'cross_prediction'
     
     Returns:
         Similarity score in [0, 1]. Higher = more similar dynamics.
     """
-    # Use the reliable state-space approach directly
-    return _simplex_fallback(series1, series2, embedding_dim)
+    # Prepare series
+    s1, s2 = prepare_series_pair(series1, series2, impute=True, normalize_length=True)
+    
+    if np.isnan(s1).any() or np.isnan(s2).any():
+        return np.nan
+    
+    # Try to use the full EDM implementation
+    try:
+        from edm_similarity import compute_edm_similarity
+        
+        result = compute_edm_similarity(
+            s1, s2,
+            method=method,
+            E=embedding_dim,
+            optimize_params=optimize_params,
+        )
+        return result['similarity']
+    
+    except ImportError:
+        # Fallback to simple implementation
+        return _simplex_fallback(s1, s2, embedding_dim or 3)
 
 
 def _simplex_fallback(
     series1: np.ndarray,
     series2: np.ndarray,
     E: int = 3,
+    tau: int = 7,
 ) -> float:
     """Fallback simplex-style similarity without pyEDM.
     
     Creates time-delay embeddings and compares trajectories using
     nearest neighbor distances in the embedded space.
+    
+    Args:
+        E: Embedding dimension
+        tau: Time delay in days (default 7 = weekly)
+    """
+    from scipy.spatial.distance import cdist
+    
+    # Normalize
+    s1 = (series1 - np.mean(series1)) / (np.std(series1) + 1e-10)
+    s2 = (series2 - np.mean(series2)) / (np.std(series2) + 1e-10)
+    
+    # Create time-delay embeddings
+    def embed(series, dim, delay):
+        n = len(series) - (dim - 1) * delay
+        if n <= 0:
+            return None
+        embedded = np.zeros((n, dim))
+        for i in range(dim):
+            start_idx = (dim - 1 - i) * delay
+            embedded[:, i] = series[start_idx:start_idx + n]
+        return embedded
+    
+    emb1 = embed(s1, E, tau)
+    emb2 = embed(s2, E, tau)
+    
+    if emb1 is None or emb2 is None:
+        return np.nan
+    
+    # Bidirectional nearest neighbor distances
+    distances = cdist(emb1, emb2, metric="euclidean")
+    nn_dist_1_to_2 = distances.min(axis=1)
+    nn_dist_2_to_1 = distances.min(axis=0)
+    mean_nn_dist = (nn_dist_1_to_2.mean() + nn_dist_2_to_1.mean()) / 2
+    
+    # Normalize by typical scale
+    typical_scale = (np.std(emb1) + np.std(emb2)) / 2 * np.sqrt(E)
+    similarity = 1 / (1 + mean_nn_dist / typical_scale)
+    
+    return similarity
+
+
+def edm_with_optimal_params(
+    series1: np.ndarray,
+    series2: np.ndarray,
+) -> dict:
+    """EDM similarity with full parameter optimization and diagnostics.
+    
+    Returns detailed results including optimal E, tau, and prediction skill.
+    
+    Returns:
+        Dictionary with 'similarity', 'E', 'tau', 'E_rho'
     """
     s1, s2 = prepare_series_pair(series1, series2, impute=True, normalize_length=True)
     
     if np.isnan(s1).any() or np.isnan(s2).any():
-        return np.nan
+        return {'similarity': np.nan, 'E': None, 'tau': None, 'E_rho': None}
     
-    # Create time-delay embeddings
-    def embed(series, dim, tau=7):  # tau=7 days is weekly lag
-        n = len(series) - (dim - 1) * tau
-        embedded = np.zeros((n, dim))
-        for i in range(dim):
-            embedded[:, i] = series[i * tau : i * tau + n]
-        return embedded
-    
-    emb1 = embed(s1, E)
-    emb2 = embed(s2, E)
-    
-    # Calculate average nearest neighbor distance from emb2 points to emb1
-    from scipy.spatial.distance import cdist
-    distances = cdist(emb2, emb1, metric="euclidean")
-    
-    # For each point in emb2, find distance to nearest neighbor in emb1
-    nn_distances = distances.min(axis=1)
-    
-    # Convert to similarity (inverse of mean distance, normalized)
-    mean_dist = nn_distances.mean()
-    
-    # Normalize by typical scale
-    typical_scale = np.std(s1) * np.sqrt(E)
-    similarity = 1 / (1 + mean_dist / typical_scale)
-    
-    return similarity
+    try:
+        from edm_similarity import compute_edm_similarity
+        return compute_edm_similarity(s1, s2, method='attractor', optimize_params=True)
+    except ImportError:
+        return {
+            'similarity': _simplex_fallback(s1, s2),
+            'E': 3,
+            'tau': 7,
+            'E_rho': None
+        }
 
 
 # =============================================================================
