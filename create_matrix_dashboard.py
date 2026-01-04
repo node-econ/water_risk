@@ -3,9 +3,11 @@ Create Simple Interactive Water Year Similarity Matrix Dashboard
 
 Generates a clean HTML dashboard with:
 - Station selector dropdown
-- Method selector (Correlation, DTW, FFT, EDM)  
+- Method selector (Correlation, DTW, FFT)  
 - Raw vs Delta toggle
 - Clear n×n matrix heatmap with values
+
+Note: EDM methods are handled separately in edm_similarity.py
 """
 
 import numpy as np
@@ -22,7 +24,6 @@ from water_year_similarity import (
     delta_correlation,
     dtw_distance,
     delta_dtw,
-    edm_simplex_similarity,
     normalize_to_365_days,
     impute_missing_linear,
     compute_delta,
@@ -90,14 +91,6 @@ def compute_pairwise_matrix(
                         val = compute_fft_similarity(d1, d2)
                     else:
                         val = compute_fft_similarity(s1, s2)
-                elif method == "edm":
-                    # Use optimize_params=False for speed in pairwise matrix
-                    # Default E=3, tau=7 provides good results without pyEDM overhead
-                    if use_delta:
-                        d1, d2 = compute_delta(s1), compute_delta(s2)
-                        val = edm_simplex_similarity(d1, d2, optimize_params=False)
-                    else:
-                        val = edm_simplex_similarity(s1, s2, optimize_params=False)
                 else:
                     val = np.nan
                 
@@ -118,7 +111,7 @@ def generate_dashboard(output_path: str):
     
     print(f"Processing {len(top_stations)} stations...")
     
-    methods = ["correlation", "dtw", "fft", "edm"]
+    methods = ["correlation", "dtw", "fft"]
     data_types = ["raw", "delta"]
     
     # Build JavaScript data object
@@ -301,7 +294,6 @@ def generate_dashboard(output_path: str):
                     <option value="correlation">Correlation</option>
                     <option value="dtw">DTW Distance</option>
                     <option value="fft">FFT Spectral</option>
-                    <option value="edm">EDM</option>
                 </select>
             </div>
             <div class="control-group">
@@ -331,8 +323,7 @@ def generate_dashboard(output_path: str):
         const methodInfo = {{
             correlation: 'Pearson correlation: 1.0 = identical, 0 = no relationship, -1 = inverse',
             dtw: 'Dynamic Time Warping distance: 0 = identical, higher = more different',
-            fft: 'FFT spectral similarity: 1.0 = identical frequency content, 0 = different',
-            edm: 'Empirical Dynamic Modeling (Sugihara et al.): State-space trajectory comparison using time-delay embedding. 1.0 = identical dynamics.'
+            fft: 'FFT spectral similarity: 1.0 = identical frequency content, 0 = different'
         }};
         
         // Initialize station dropdown

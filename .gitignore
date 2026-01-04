@@ -78,3 +78,4 @@ secrets.py
 .DS_Store
 Thumbs.db
 
+migration_export/

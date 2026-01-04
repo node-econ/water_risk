@@ -6,8 +6,10 @@ using multiple similarity metrics:
     1. Dynamic Time Warping (DTW) - handles timing shifts
     2. Longest Common Subsequence (LCSS) - robust to missing values
     3. Pearson Correlation - shape similarity
-    4. Empirical Dynamic Modeling (EDM) - state space similarity
+    4. Euclidean Distance - point-by-point comparison
     5. Delta methods (Δ SWE) - based on daily change, captures dynamics
+
+Note: EDM (Empirical Dynamic Modeling) methods are in edm_similarity.py
 
 Water Year: October 1 (Year N-1) through September 30 (Year N)
 Example: WY 2025 = Oct 1, 2024 → Sep 30, 2025
@@ -476,145 +478,13 @@ def euclidean_distance(series1: np.ndarray, series2: np.ndarray) -> float:
 
 
 # =============================================================================
-# EDM-BASED SIMILARITY (Sugihara et al.)
-# =============================================================================
-
-def edm_simplex_similarity(
-    series1: np.ndarray,
-    series2: np.ndarray,
-    embedding_dim: Optional[int] = None,
-    optimize_params: bool = True,
-    method: str = 'attractor',
-) -> float:
-    """Calculate similarity using Empirical Dynamic Modeling concepts.
-    
-    Uses state-space reconstruction following Sugihara & May (1990) and
-    the pyEDM library when available.
-    
-    The method:
-    1. Auto-select optimal embedding dimension E using prediction skill
-    2. Auto-select optimal time delay tau using autocorrelation decay
-    3. Create time-delay embeddings (Takens' theorem)
-    4. Compare attractor trajectories or cross-prediction skill
-    
-    Args:
-        embedding_dim: Dimension for time-delay embedding (auto-optimized if None)
-        optimize_params: Whether to auto-optimize E and tau (default True)
-        method: 'attractor' (trajectory comparison) or 'cross_prediction'
-    
-    Returns:
-        Similarity score in [0, 1]. Higher = more similar dynamics.
-    """
-    # Prepare series
-    s1, s2 = prepare_series_pair(series1, series2, impute=True, normalize_length=True)
-    
-    if np.isnan(s1).any() or np.isnan(s2).any():
-        return np.nan
-    
-    # Try to use the full EDM implementation
-    try:
-        from edm_similarity import compute_edm_similarity
-        
-        result = compute_edm_similarity(
-            s1, s2,
-            method=method,
-            E=embedding_dim,
-            optimize_params=optimize_params,
-        )
-        return result['similarity']
-    
-    except ImportError:
-        # Fallback to simple implementation
-        return _simplex_fallback(s1, s2, embedding_dim or 3)
-
-
-def _simplex_fallback(
-    series1: np.ndarray,
-    series2: np.ndarray,
-    E: int = 3,
-    tau: int = 7,
-) -> float:
-    """Fallback simplex-style similarity without pyEDM.
-    
-    Creates time-delay embeddings and compares trajectories using
-    nearest neighbor distances in the embedded space.
-    
-    Args:
-        E: Embedding dimension
-        tau: Time delay in days (default 7 = weekly)
-    """
-    from scipy.spatial.distance import cdist
-    
-    # Normalize
-    s1 = (series1 - np.mean(series1)) / (np.std(series1) + 1e-10)
-    s2 = (series2 - np.mean(series2)) / (np.std(series2) + 1e-10)
-    
-    # Create time-delay embeddings
-    def embed(series, dim, delay):
-        n = len(series) - (dim - 1) * delay
-        if n <= 0:
-            return None
-        embedded = np.zeros((n, dim))
-        for i in range(dim):
-            start_idx = (dim - 1 - i) * delay
-            embedded[:, i] = series[start_idx:start_idx + n]
-        return embedded
-    
-    emb1 = embed(s1, E, tau)
-    emb2 = embed(s2, E, tau)
-    
-    if emb1 is None or emb2 is None:
-        return np.nan
-    
-    # Bidirectional nearest neighbor distances
-    distances = cdist(emb1, emb2, metric="euclidean")
-    nn_dist_1_to_2 = distances.min(axis=1)
-    nn_dist_2_to_1 = distances.min(axis=0)
-    mean_nn_dist = (nn_dist_1_to_2.mean() + nn_dist_2_to_1.mean()) / 2
-    
-    # Normalize by typical scale
-    typical_scale = (np.std(emb1) + np.std(emb2)) / 2 * np.sqrt(E)
-    similarity = 1 / (1 + mean_nn_dist / typical_scale)
-    
-    return similarity
-
-
-def edm_with_optimal_params(
-    series1: np.ndarray,
-    series2: np.ndarray,
-) -> dict:
-    """EDM similarity with full parameter optimization and diagnostics.
-    
-    Returns detailed results including optimal E, tau, and prediction skill.
-    
-    Returns:
-        Dictionary with 'similarity', 'E', 'tau', 'E_rho'
-    """
-    s1, s2 = prepare_series_pair(series1, series2, impute=True, normalize_length=True)
-    
-    if np.isnan(s1).any() or np.isnan(s2).any():
-        return {'similarity': np.nan, 'E': None, 'tau': None, 'E_rho': None}
-    
-    try:
-        from edm_similarity import compute_edm_similarity
-        return compute_edm_similarity(s1, s2, method='attractor', optimize_params=True)
-    except ImportError:
-        return {
-            'similarity': _simplex_fallback(s1, s2),
-            'E': 3,
-            'tau': 7,
-            'E_rho': None
-        }
-
-
-# =============================================================================
 # COMPARISON FUNCTIONS
 # =============================================================================
 
 def compute_all_similarities(
     wy_data: pd.DataFrame,
     target_wy: int,
-    methods: list[str] = ["dtw", "lcss", "correlation", "euclidean", "edm"],
+    methods: list[str] = ["dtw", "lcss", "correlation", "euclidean"],
 ) -> pd.DataFrame:
     """Compute similarity between target water year and all others.
     
@@ -622,9 +492,11 @@ def compute_all_similarities(
         wy_data: DataFrame with water years as columns, day_of_wy as index
         target_wy: Water year to compare against
         methods: List of methods to use. Available methods:
-            - Raw SWE methods: "dtw", "lcss", "correlation", "euclidean", "edm"
+            - Raw SWE methods: "dtw", "lcss", "correlation", "euclidean"
             - Delta (Δ SWE) methods: "delta_correlation", "delta_euclidean", 
               "delta_dtw", "delta_fft"
+            
+            Note: For EDM methods, see edm_similarity.py
     
     Returns:
         DataFrame with similarity scores for each water year and method
@@ -654,9 +526,6 @@ def compute_all_similarities(
         
         if "euclidean" in methods:
             row["euclidean_distance"] = euclidean_distance(target_series, comparison_series)
-        
-        if "edm" in methods:
-            row["edm_similarity"] = edm_simplex_similarity(target_series, comparison_series)
         
         # Delta (Δ SWE) methods - based on daily change
         if "delta_correlation" in methods:
@@ -692,8 +561,10 @@ def find_most_similar_years(
         target_wy: Water year to compare against
         n_similar: Number of similar years to return
         method: Similarity method to use. Options:
-            - Raw: "dtw", "lcss", "correlation", "euclidean", "edm"
+            - Raw: "dtw", "lcss", "correlation", "euclidean"
             - Delta: "delta_correlation", "delta_euclidean", "delta_dtw", "delta_fft"
+            
+            Note: For EDM methods, see edm_similarity.py
     
     Returns:
         DataFrame with top N similar years and their scores
@@ -709,7 +580,7 @@ def find_most_similar_years(
         sorted_df = similarities.sort_values(col_name, ascending=True)
     else:
         # Similarity metrics - higher is better
-        if method in ["lcss", "edm", "delta_fft"]:
+        if method in ["lcss", "delta_fft"]:
             col_name = f"{method}_similarity"
         elif method in ["correlation", "delta_correlation"]:
             col_name = method
@@ -739,13 +610,12 @@ def compute_pairwise_similarity_matrix(
         "lcss": lcss_similarity,
         "correlation": correlation_similarity,
         "euclidean": euclidean_distance,
-        "edm": edm_simplex_similarity,
     }[method]
     
     for i, wy1 in enumerate(water_years):
         for j, wy2 in enumerate(water_years):
             if i == j:
-                matrix[i, j] = 1.0 if method in ["lcss", "correlation", "edm"] else 0.0
+                matrix[i, j] = 1.0 if method in ["lcss", "correlation"] else 0.0
             elif i < j:
                 score = method_func(wy_data[wy1].values, wy_data[wy2].values)
                 matrix[i, j] = score
@@ -803,7 +673,7 @@ def analyze_station_water_years(
     print("Computing similarities...")
     similarities = compute_all_similarities(
         wy_data, target_wy,
-        methods=["dtw", "lcss", "correlation", "euclidean", "edm"]
+        methods=["dtw", "lcss", "correlation", "euclidean"]
     )
     
     # Find top similar years by each method
@@ -825,7 +695,6 @@ def analyze_station_water_years(
         ("euclidean_distance", True),
         ("correlation", False),
         ("lcss_similarity", False),
-        ("edm_similarity", False),
     ]:
         if method in similarities.columns:
             top_5 = similarities[method].sort_values(ascending=ascending).head(5)
